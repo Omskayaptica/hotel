@@ -1,0 +1,193 @@
+-- 1. Типы номеров (выделяем в отдельную таблицу, чтобы избежать дублирования цен и описаний)
+CREATE TABLE room_types (
+    type_id SERIAL PRIMARY KEY,
+    type_name VARCHAR(50) NOT NULL,
+    price_per_night DECIMAL(10, 2) NOT NULL
+);
+
+-- 2. Номера (ссылаются на тип номера)
+CREATE TABLE rooms (
+    room_id SERIAL PRIMARY KEY,
+    room_number INT NOT NULL UNIQUE,
+    type_id INT REFERENCES room_types(type_id) ON DELETE CASCADE,
+    status VARCHAR(20) DEFAULT 'Свободен' CHECK (status IN ('Свободен', 'Занят', 'На уборке'))
+);
+
+-- 3. Гости
+CREATE TABLE guests (
+    guest_id SERIAL PRIMARY KEY,
+    full_name VARCHAR(100) NOT NULL,
+    passport VARCHAR(20) UNIQUE NOT NULL,
+    phone VARCHAR(20)
+);
+
+-- 4. Бронирования (связующая таблица)
+CREATE TABLE bookings (
+    booking_id SERIAL PRIMARY KEY,
+    guest_id INT REFERENCES guests(guest_id) ON DELETE CASCADE,
+    room_id INT REFERENCES rooms(room_id) ON DELETE CASCADE,
+    check_in DATE NOT NULL,
+    check_out DATE NOT NULL,
+    total_cost DECIMAL(10, 2),
+    
+    CONSTRAINT check_dates CHECK (check_out > check_in) -- Базовая проверка дат
+);
+
+
+INSERT INTO room_types (type_name, price_per_night) VALUES 
+('Стандарт', 3000), 
+('Люкс', 7000), 
+('Президентский', 15000);
+
+INSERT INTO rooms (room_number, type_id) VALUES 
+(101, 1), (102, 1), (201, 2), (202, 2), (301, 3);
+
+INSERT INTO guests (full_name, passport, phone) VALUES 
+('Иванов Иван Иванович', '1234 567890', '+79001112233');
+
+
+
+CREATE OR REPLACE FUNCTION calculate_total_cost(p_room_id INT, p_check_in DATE, p_check_out DATE)
+RETURNS DECIMAL AS $$
+DECLARE
+    v_price_per_night DECIMAL;
+    v_days INT;
+BEGIN
+    -- Считаем количество дней
+    v_days := p_check_out - p_check_in;
+    
+    -- Получаем цену за ночь для данного номера
+    SELECT rt.price_per_night INTO v_price_per_night
+    FROM rooms r
+    JOIN room_types rt ON r.type_id = rt.type_id
+    WHERE r.room_id = p_room_id;
+
+    RETURN v_price_per_night * v_days;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+CREATE OR REPLACE PROCEDURE make_booking(
+    p_guest_id INT,
+    p_room_id INT,
+    p_check_in DATE,
+    p_check_out DATE
+)
+AS $$
+DECLARE
+    v_total_cost DECIMAL;
+BEGIN
+    -- Используем нашу функцию для расчета цены
+    v_total_cost := calculate_total_cost(p_room_id, p_check_in, p_check_out);
+    
+    INSERT INTO bookings (guest_id, room_id, check_in, check_out, total_cost)
+    VALUES (p_guest_id, p_room_id, p_check_in, p_check_out, v_total_cost);
+    
+    COMMIT;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+
+CREATE OR REPLACE FUNCTION update_room_status_func()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE rooms SET status = 'Занят' WHERE room_id = NEW.room_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_after_booking
+AFTER INSERT ON bookings
+FOR EACH ROW
+EXECUTE FUNCTION update_room_status_func();
+
+
+
+CREATE OR REPLACE FUNCTION check_room_availability()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM rooms WHERE room_id = NEW.room_id AND status = 'Занят'
+    ) THEN
+        RAISE EXCEPTION 'Этот номер уже занят!';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_before_booking
+BEFORE INSERT ON bookings
+FOR EACH ROW
+EXECUTE FUNCTION check_room_availability();
+
+
+
+
+CALL make_booking(1, 1, '2023-10-01', '2023-10-05');
+
+
+
+SELECT * FROM bookings;
+
+SELECT * FROM rooms;
+
+
+
+CREATE OR REPLACE PROCEDURE make_booking(
+    p_guest_id INT,
+    p_room_id INT,
+    p_check_in DATE,
+    p_check_out DATE
+)
+AS $$
+DECLARE
+    v_total_cost DECIMAL;
+BEGIN
+    -- Используем нашу функцию для расчета цены
+    v_total_cost := calculate_total_cost(p_room_id, p_check_in, p_check_out);
+    
+    INSERT INTO bookings (guest_id, room_id, check_in, check_out, total_cost)
+    VALUES (p_guest_id, p_room_id, p_check_in, p_check_out, v_total_cost);
+    
+    -- МЫ УДАЛИЛИ COMMIT ОТСЮДА
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+
+-- 1. Сначала удалим старый триггер, который просто ставил статус "Занят"
+DROP TRIGGER IF EXISTS trg_before_booking ON bookings;
+
+-- 2. Обновляем процедуру: теперь она проверяет доступность дат
+CREATE OR REPLACE PROCEDURE make_booking(
+    p_guest_id INT,
+    p_room_id INT,
+    p_check_in DATE,
+    p_check_out DATE
+)
+AS $$
+DECLARE
+    v_total_cost DECIMAL;
+    v_overlap_count INT;
+BEGIN
+    -- Проверка: нет ли бронирований, которые пересекаются с нашими датами
+    SELECT COUNT(*) INTO v_overlap_count
+    FROM bookings
+    WHERE room_id = p_room_id
+      AND (p_check_in < check_out AND p_check_out > check_in);
+
+    IF v_overlap_count > 0 THEN
+        RAISE EXCEPTION 'Этот номер уже забронирован на выбранные даты!';
+    END IF;
+
+    -- Если всё ок, считаем цену и сохраняем
+    v_total_cost := calculate_total_cost(p_room_id, p_check_in, p_check_out);
+    
+    INSERT INTO bookings (guest_id, room_id, check_in, check_out, total_cost)
+    VALUES (p_guest_id, p_room_id, p_check_in, p_check_out, v_total_cost);
+END;
+$$ LANGUAGE plpgsql;
